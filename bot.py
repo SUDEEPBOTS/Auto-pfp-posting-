@@ -38,7 +38,7 @@ async def check_with_gemini(image_url, category):
         
         # Latest Gemini 2.0 API call
         result = client_gemini.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=[prompt, response.content]
         )
         return "Yes" in result.text
