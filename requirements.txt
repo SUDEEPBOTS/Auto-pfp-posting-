@@ -4,6 +4,6 @@ motor
 apscheduler
 flask
 requests
-google-generativeai
+google-genai
 pymongo
 
