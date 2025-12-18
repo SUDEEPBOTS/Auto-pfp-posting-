@@ -23,7 +23,7 @@ CHANNEL_LINK = "@Aesthetic_Channel" # Apna channel username yahan badlein
 
 # Gemini 2.0 Flash Setup
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+gemini_model = genai.GenerativeModel('gemini-2.5-flash-exp')
 
 app_bot = Client("aesthetic_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 db_client = AsyncIOMotorClient(MONGO_URL)
