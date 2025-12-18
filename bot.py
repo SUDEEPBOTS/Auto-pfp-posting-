@@ -1,229 +1,296 @@
 import os
 import asyncio
 import requests
-import tempfile
-from threading import Thread
-
-from flask import Flask
-from pyrogram import Client, filters
-from pyrogram.types import InputMediaPhoto, InlineKeyboardMarkup, InlineKeyboardButton
-
-from motor.motor_asyncio import AsyncIOMotorClient
-
 import google.generativeai as genai
-from google.generativeai.types import content_types
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from motor.motor_asyncio import AsyncIOMotorClient
+from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask
+from threading import Thread
+import logging
 
+# Setup logging for debugging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ================= CONFIG =================
-
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-MONGO_URL = os.getenv("MONGO_URL")
-
+# --- CONFIGURATION ---
+API_ID = int(os.getenv("API_ID", "12345"))
+API_HASH = os.getenv("API_HASH", "your_hash")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "your_token")
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = "b74e609faafda42e8"
-
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "b74e609faafda42e8")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 OWNER_ID = 8228478790
-CHANNEL_ID = -1003593852129
-CHANNEL_LINK = "@Aesthetic_Channel"
+CHANNEL_ID = -1003593852129  # Ensure this is correct
+CHANNEL_LINK = "@Aesthetic_Channel"  # Your channel link
 
-# =========================================
-
+# Gemini Setup
 genai.configure(api_key=GEMINI_API_KEY)
-gemini = genai.GenerativeModel("gemini-2.5-flash")
+gemini_model = genai.GenerativeModel('gemini-2.0-flash')  # Use 2.0-flash for stability
 
-bot = Client(
-    "aesthetic_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+# Initialize bot
+app_bot = Client(
+    "aesthetic_bot", 
+    api_id=API_ID, 
+    api_hash=API_HASH, 
+    bot_token=BOT_TOKEN,
+    in_memory=True
 )
 
-mongo = AsyncIOMotorClient(MONGO_URL)
-db = mongo["aesthetic_db"]["images"]
+# Database setup
+db_client = AsyncIOMotorClient(MONGO_URL)
+db = db_client["aesthetic_db"]["posted_images"]
 
-web = Flask(__name__)
-
-
-# ================= UTILS =================
-
-def caption(category, pfp_type):
+def get_caption(category):
     emoji = "👦" if category == "boys" else "👧"
-    return (
-        f"> ✨ **NEW {category.upper()} AESTHETIC PFP PACK** {emoji}\n\n"
+    cap = (
+        f"✨ NEW {category.upper()} AESTHETIC PACK {emoji}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 **Category:** #{category.capitalize()}\n"
-        f"🎭 **Type:** {pfp_type}\n"
-        f"📸 **Quality:** HD PFP\n"
-        f"🤖 **Verified:** Gemini AI\n"
+        f"👤 Type: #{category.capitalize()} #Anime #PFP\n"
+        f"📸 Quantity: 05 High Definition Pix\n"
+        f"🎨 Verified by Gemini AI\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🚀 **Join:** {CHANNEL_LINK}"
+        f"🚀 Join: {CHANNEL_LINK}"
     )
+    return cap
 
-
-async def google_images(query):
+async def fetch_images(query):
     url = "https://www.googleapis.com/customsearch/v1"
     params = {
-        "q": query,
-        "cx": GOOGLE_CSE_ID,
-        "key": GOOGLE_API_KEY,
-        "searchType": "image",
-        "num": 20
+        'q': query,
+        'cx': GOOGLE_CSE_ID,
+        'key': GOOGLE_API_KEY,
+        'searchType': 'image',
+        'num': 10,  # Reduced for faster testing
+        'imgSize': 'large'
     }
-    r = requests.get(url, params=params).json()
-    return [i["link"] for i in r.get("items", [])]
-
-
-async def download_image(url):
     try:
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            return None
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        tmp.write(r.content)
-        tmp.close()
-        return tmp.name, r.content
-    except:
-        return None
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        res = response.json()
+        items = res.get('items', [])
+        logger.info(f"Found {len(items)} images for query: {query}")
+        return [item['link'] for item in items]
+    except Exception as e:
+        logger.error(f"Google Search failed: {e}")
+        return []
 
-
-async def gemini_check(image_bytes):
-    """
-    Gemini image dekh kar batayega:
-    - boy / girl
-    - anime / real
-    - pfp suitable hai ya nahi
-    """
-    blob = content_types.Blob(
-        mime_type="image/jpeg",
-        data=image_bytes
-    )
-
-    prompt = (
-        "Analyze this image and answer strictly in this format:\n"
-        "Gender: Boy or Girl\n"
-        "Style: Anime or Real\n"
-        "PFP: Yes or No\n"
-    )
-
-    res = gemini.generate_content([prompt, blob])
-    text = res.text.lower()
-
-    if "pfp: yes" not in text:
-        return None
-
-    gender = "boys" if "boy" in text else "girls"
-    style = "Anime" if "anime" in text else "Real"
-
-    return gender, style
-
-
-# ================= CORE =================
-
-async def post_pack(expected_category):
-    print(f"[INFO] Searching {expected_category} images")
-
-    links = await google_images(f"{expected_category} aesthetic pfp anime 4k")
-
-    media = []
-    pfp_style = "Unknown"
-
-    for link in links:
-        if await db.find_one({"url": link}):
-            continue
-
-        downloaded = await download_image(link)
-        if not downloaded:
-            continue
-
-        file_path, img_bytes = downloaded
-
-        gemini_result = await gemini_check(img_bytes)
-        if not gemini_result:
-            continue
-
-        detected_category, style = gemini_result
-
-        if detected_category != expected_category:
-            continue
-
-        pfp_style = style
-
-        await db.insert_one({
-            "url": link,
-            "category": detected_category,
-            "style": style
-        })
-
-        if not media:
-            media.append(
-                InputMediaPhoto(
-                    file_path,
-                    caption=caption(detected_category, style)
-                )
-            )
-        else:
-            media.append(InputMediaPhoto(file_path))
-
-        print(f"[OK] Image approved: {style}")
-
-        if len(media) == 5:
-            break
-
-    if len(media) < 5:
-        print("[FAIL] Enough images not found")
+async def check_with_gemini(image_url, category):
+    try:
+        # Download image
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(image_url, timeout=15, headers=headers)
+        if response.status_code != 200:
+            logger.warning(f"Failed to download image: {response.status_code}")
+            return False
+        
+        # Check image size
+        if len(response.content) < 10240:  # Less than 10KB
+            logger.warning("Image too small, skipping")
+            return False
+        
+        # Gemini check
+        prompt = f"""
+        Analyze this image as a potential profile picture (PFP):
+        1. Is this a high-quality image? (good resolution, clear)
+        2. Is this aesthetic/artistic?
+        3. Is this suitable for {category}?
+        4. Is this appropriate/SFW?
+        
+        Answer ONLY with 'APPROVED' if all conditions are met, otherwise 'REJECTED'.
+        """
+        
+        try:
+            result = gemini_model.generate_content([
+                prompt,
+                {"mime_type": "image/jpeg", "data": response.content}
+            ])
+            
+            if hasattr(result, 'text'):
+                verdict = result.text.strip().upper()
+                logger.info(f"Gemini verdict: {verdict} for {image_url[:50]}...")
+                return "APPROVED" in verdict
+            else:
+                logger.warning("No text in Gemini response")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Gemini API error: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error checking image: {e}")
         return False
 
-    await bot.send_media_group(CHANNEL_ID, media)
-    print("[SUCCESS] Posted to channel")
-    return True
+async def post_pack(category):
+    logger.info(f"Starting pack posting for {category}...")
+    
+    links = await fetch_images(f"{category} aesthetic anime pfp 2025")
+    
+    if not links:
+        logger.error("No images found from Google")
+        return False
+    
+    final_list = []
+    processed_count = 0
+    
+    for link in links:
+        try:
+            # Check if already posted
+            existing = await db.find_one({"url": link})
+            if existing:
+                logger.info(f"Image already posted, skipping: {link[:50]}...")
+                continue
+            
+            processed_count += 1
+            logger.info(f"Processing image {processed_count}/{len(links)}")
+            
+            # Check with Gemini
+            if await check_with_gemini(link, category):
+                final_list.append(link)
+                await db.insert_one({"url": link, "category": category})
+                logger.info(f"✅ Image approved: {link[:50]}...")
+                
+                if len(final_list) == 5:
+                    break
+            else:
+                logger.info(f"❌ Image rejected by AI")
+                
+        except Exception as e:
+            logger.error(f"Error processing image: {e}")
+            continue
+    
+    if len(final_list) >= 3:  # Changed to minimum 3 images
+        try:
+            caption = get_caption(category)
+            
+            # Create media group
+            media_group = []
+            for i, img_url in enumerate(final_list[:5]):  # Max 5 images
+                if i == 0:
+                    media_group.append(InputMediaPhoto(img_url, caption=caption))
+                else:
+                    media_group.append(InputMediaPhoto(img_url))
+            
+            # Send to Telegram
+            await app_bot.send_media_group(
+                chat_id=CHANNEL_ID,
+                media=media_group
+            )
+            
+            logger.info(f"✅ Successfully posted {len(final_list)} images to channel")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Telegram posting failed: {e}")
+            
+            # Try sending images individually
+            try:
+                caption = get_caption(category)
+                await app_bot.send_photo(
+                    CHANNEL_ID,
+                    final_list[0],
+                    caption=caption
+                )
+                
+                for img_url in final_list[1:]:
+                    await app_bot.send_photo(CHANNEL_ID, img_url)
+                    
+                logger.info("Posted images individually")
+                return True
+            except Exception as e2:
+                logger.error(f"Individual posting also failed: {e2}")
+                return False
+    else:
+        logger.error(f"Not enough approved images. Found: {len(final_list)}")
+        return False
 
+# --- FLASK & SCHEDULER ---
+web_app = Flask(__name__)
 
-# ================= BOT =================
+@web_app.route('/')
+def home():
+    return "Bot is Online!"
 
-@bot.on_message(filters.command("start") & filters.user(OWNER_ID))
-async def start(_, msg):
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Post Boys 👦", callback_data="boys"),
-            InlineKeyboardButton("Post Girls 👧", callback_data="girls")
-        ]
-    ])
-    await msg.reply(
-        "✨ **Aesthetic PFP Bot Active**\n"
-        "🤖 Gemini 2.5 Flash\n"
-        "📦 MongoDB Enabled",
-        reply_markup=kb
+@web_app.route('/health')
+def health():
+    return {"status": "healthy", "service": "aesthetic_bot"}
+
+def auto_job():
+    """Background job for scheduled posting"""
+    logger.info("Running scheduled job...")
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Start bot if not running
+        if not app_bot.is_connected:
+            loop.run_until_complete(app_bot.start())
+        
+        # Post packs
+        loop.run_until_complete(post_pack("boys"))
+        loop.run_until_complete(asyncio.sleep(10))  # Wait 10 seconds
+        loop.run_until_complete(post_pack("girls"))
+        
+    except Exception as e:
+        logger.error(f"Scheduled job failed: {e}")
+    finally:
+        if loop.is_running():
+            loop.close()
+
+# Initialize scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(auto_job, 'cron', hour='0,6,12,18')
+scheduler.start()
+
+# --- Bot Handlers ---
+@app_bot.on_message(filters.command("start") & filters.user(OWNER_ID))
+async def start_msg(client, message):
+    btns = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Manual Post Boys 👦", callback_data="do_boys"),
+        InlineKeyboardButton("Manual Post Girls 👧", callback_data="do_girls")
+    ]])
+    await message.reply_text(
+        "✨ Aesthetic PFP Bot\nStatus: Active\nModel: Gemini 2.0 Flash\n\n"
+        "Click buttons to post manually:",
+        reply_markup=btns
     )
 
-
-@bot.on_callback_query(filters.user(OWNER_ID))
-async def cb(_, q):
-    await q.answer("AI working...")
-    ok = await post_pack(q.data)
-    if ok:
-        await q.message.edit_text("✅ Posted Successfully")
+@app_bot.on_callback_query(filters.user(OWNER_ID))
+async def btn_callback(client, cb):
+    cat = "boys" if cb.data == "do_boys" else "girls"
+    await cb.answer(f"AI is searching {cat} pics...")
+    
+    status = await post_pack(cat)
+    
+    if status:
+        await cb.message.edit_text(f"✅ Successful! {cat.capitalize()} pack posted to channel.")
     else:
-        await q.message.edit_text("❌ Failed (Check logs)")
+        await cb.message.edit_text(f"❌ Failed to post {cat} pack. Check logs.")
 
-
-# ================= WEB =================
-
-@web.route("/")
-def home():
-    return "Bot Online"
-
+@app_bot.on_message(filters.command("status") & filters.user(OWNER_ID))
+async def status_check(client, message):
+    try:
+        count = await db.count_documents({})
+        await message.reply_text(f"📊 Database Stats:\nTotal Images: {count}\nBot Status: ✅ Running")
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {e}")
 
 if __name__ == "__main__":
+    # Start Flask web server in thread
     Thread(
-        target=lambda: web.run(
+        target=lambda: web_app.run(
             host="0.0.0.0",
-            port=int(os.getenv("PORT", 8080))
+            port=int(os.environ.get("PORT", 8080)),
+            debug=False,
+            threaded=True
         )
     ).start()
-
-    bot.run()
+    
+    # Start the bot
+    logger.info("Starting Telegram Bot...")
+    app_bot.run()
