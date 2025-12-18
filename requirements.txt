@@ -1,0 +1,9 @@
+pyrogram
+tgcrypto
+motor
+apscheduler
+flask
+requests
+google-generativeai
+pymongo
+
